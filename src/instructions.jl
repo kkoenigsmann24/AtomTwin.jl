@@ -20,7 +20,7 @@ Apply laser coupling for a fixed duration or with a shaped amplitude profile.
 - `duration::Float64` – pulse duration in seconds. The compiled pulse will span exactly this duration.
 - `ampl::ComplexF64` – overall coupling strength (relative to the default). Can be complex. It scales the entire amplitude shape.
 - `amplitudes::Vector{ComplexF64}` – vector of complex amplitudes defining the pulse shape. If empty, the pulse has constant amplitude `ampl` over `duration`. If non‑empty, the shape is resampled onto the simulation time grid using the method selected by `interp`.
-- `interp::Symbol` – interpolation method for the amplitude envelope: `:lagrange` (default, cubic Lagrange) or `:piecewise_constant` (each sample held for its fraction of `duration`, matching the original pulse generator convention).
+- `interp::Symbol` – how the envelope is read between its samples: `:cubic` (default, Catmull-Rom, 4th order), `:linear` (2nd order), or `:constant` (each sample held for its fraction of `duration` — a physical staircase, correct for AWG-defined waveforms). `:lagrange` and `:piecewise_constant` are accepted as aliases for `:cubic` and `:constant`.
 """
 struct Pulse <: AbstractInstruction
     couplings::Vector{Switchable}
@@ -33,7 +33,7 @@ struct Pulse <: AbstractInstruction
 end
 
 """
-    Pulse(couplings::Vector{<:Switchable}, duration; ampl=1.0, amplitudes=ComplexF64[], interp=:lagrange)
+    Pulse(couplings::Vector{<:Switchable}, duration; ampl=1.0, amplitudes=ComplexF64[], interp=:cubic)
 
 Construct a `Pulse` acting on multiple couplings simultaneously, all with the same duration and relative amplitude `ampl`.
 
@@ -42,18 +42,18 @@ Construct a `Pulse` acting on multiple couplings simultaneously, all with the sa
 - `duration`: pulse duration (seconds). The compiled pulse will span exactly this duration.
 - `ampl`: overall coupling strength (relative to default). Scales the entire amplitude shape.
 - `amplitudes`: optional vector of amplitudes defining the pulse shape. If empty, the pulse has constant amplitude `ampl` over `duration`. If non‑empty, the shape is resampled onto the simulation time grid using the method selected by `interp`.
-- `interp`: interpolation method — `:lagrange` (default, cubic) or `:piecewise_constant`.
+- `interp`: how the envelope is read between samples — `:cubic` (default), `:linear` or `:constant`.
 """
-function Pulse(couplings::Vector, duration::Float64; ampl=1.0, amplitudes=ComplexF64[], dt=nothing, downsample=nothing, interp=:lagrange)
+function Pulse(couplings::Vector, duration::Float64; ampl=1.0, amplitudes=ComplexF64[], dt=nothing, downsample=nothing, interp=:cubic)
     Pulse(couplings, duration, ampl, amplitudes, dt, downsample, interp)
 end
 
 """
-    Pulse(coupling::Switchable, duration; ampl=1.0, amplitudes=ComplexF64[], interp=:lagrange)
+    Pulse(coupling::Switchable, duration; ampl=1.0, amplitudes=ComplexF64[], interp=:cubic)
 
 Convenience constructor for a single‑coupling pulse. Equivalent to `Pulse([coupling], duration; ampl, amplitudes, interp)`.
 """
-Pulse(coupling::Switchable, duration::Float64; ampl=1.0, amplitudes=ComplexF64[], dt=nothing, downsample=nothing, interp=:lagrange) = Pulse([coupling], duration, ampl, amplitudes, dt, downsample, interp)
+Pulse(coupling::Switchable, duration::Float64; ampl=1.0, amplitudes=ComplexF64[], dt=nothing, downsample=nothing, interp=:cubic) = Pulse([coupling], duration, ampl, amplitudes, dt, downsample, interp)
 
 """
     On(couplings)
@@ -353,3 +353,19 @@ Convenience constructor for Parallel with optional per-instruction overrides.
 """
 Parallel(parts::AbstractVector{<:AbstractInstruction}; dt=nothing, downsample=nothing) =
     Parallel(AbstractInstruction[parts...], dt, downsample)
+
+"""
+    instruction_duration(inst) -> Float64
+
+The time `inst` occupies: its `duration` (a ramp's `ramp_time`), `0` for an
+instantaneous instruction, and for a [`Parallel`](@ref) the longest of its
+parts, which it has no field for.
+
+`compile` realises this span exactly by setting the instruction's step to
+`duration / nsteps`. Without it a `Parallel` fell back to the requested step, so
+one whose parts count their steps differently -- a move counts grid points, one
+more than a pulse's steps -- ran a step long and stretched every pulse inside it.
+"""
+instruction_duration(inst) = hasproperty(inst, :duration) ? Float64(inst.duration) : 0.0
+instruction_duration(inst::Union{RampRow, RampCol}) = Float64(inst.ramp_time)
+instruction_duration(p::Parallel) = maximum(instruction_duration, p.parts; init = 0.0)

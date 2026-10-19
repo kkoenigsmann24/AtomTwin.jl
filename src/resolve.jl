@@ -38,15 +38,51 @@ function _resolve(x::Number, param_values, cache::IdDict) x end
     _resolve(x::String, param_values, cache::IdDict)
     _resolve(x::Symbol, param_values, cache::IdDict)
     _resolve(x::Function, param_values, cache::IdDict)
-    _resolve(x::TweezerArray, param_values, cache::IdDict)
 
-Internal helpers: symbols, functions, and `TweezerArray` instances are
-treated as already-resolved primitives and returned unchanged.
+Internal helpers: symbols and functions are treated as already-resolved
+primitives and returned unchanged.
 """
 function _resolve(x::String, param_values, cache::IdDict) x end
 function _resolve(x::Symbol, param_values, cache::IdDict) x end
 function _resolve(x::Function, param_values, cache::IdDict) x end
-function _resolve(x::TweezerArray, param_values, cache::IdDict) x end
+
+"""
+    _resolve(b::AbstractBeam, param_values, cache::IdDict)
+
+Resolve a concrete beam to a **private copy** (cached per original beam), so the
+compiled job owns its trapping beams and never mutates the user's `System` /
+`TweezerArray`. Inner-loop modifiers (`MoveModifier`, `PositionModifier`,
+`AmplitudeModifier`) mutate `beam.r0` / `beam._coeff` in place; copying here is
+what decouples that runtime state from the source objects. The cache keys on the
+original beam's identity so that the same copy is reused everywhere it appears
+(e.g. the `System` beam list and the `TweezerArray` an instruction holds).
+"""
+function _resolve(b::AbstractBeam, param_values, cache::IdDict)
+    get!(cache, b) do
+        copy(b)
+    end
+end
+
+"""
+    _resolve(ta::TweezerArray, param_values, cache::IdDict)
+
+Resolve a `TweezerArray` to a cached copy whose beams are the per-beam cached
+copies (see [`_resolve(::AbstractBeam, ...)`]). This keeps the beams handed to
+move/ramp modifiers identical to those stored in the job, while leaving the
+caller's array untouched.
+"""
+function _resolve(ta::TweezerArray, param_values, cache::IdDict)
+    get!(cache, ta) do
+        new_beams = GaussianBeam[_resolve(b, param_values, cache) for b in ta.beams]
+        TweezerArray(
+            ta.λ, ta.w0, ta.P_total, ta.r0,
+            copy(ta.row_freqs), copy(ta.col_freqs),
+            copy(ta.row_amplitudes), copy(ta.col_amplitudes),
+            ta.dx, ta.dy,
+            new_beams,
+        )
+    end
+end
 
 """
     _resolve(x::Vector, param_values, cache::IdDict)
@@ -67,12 +103,16 @@ end
 """
     _resolve(seq::Sequence, param_values, cache::IdDict)
 
-Resolve all instructions in a `Sequence`, preserving its time step `dt`.
+Resolve all instructions in a `Sequence`, preserving its solver settings.
 
-Returns a new `Sequence` with the same `dt` and resolved instructions.
+Returns a new `Sequence` with the same `dt`, `downsample` and `tol`, and resolved
+instructions.
 """
 function _resolve(seq::Sequence, param_values, cache::IdDict)
-    Sequence([_resolve(inst, param_values, cache) for inst in seq.instructions], seq.dt)
+    # NB: pass every field. Reconstructing with only (instructions, dt) silently
+    # dropped `downsample` back to its default.
+    Sequence([_resolve(inst, param_values, cache) for inst in seq.instructions],
+             seq.dt, seq.downsample, seq.tol)
 end
 
 """

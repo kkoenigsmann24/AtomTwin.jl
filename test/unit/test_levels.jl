@@ -1,0 +1,86 @@
+# Superposition algebra: scalar multiply/divide/negate compose to a flat,
+# correctly-weighted coefficient dict for arbitrary state expressions.
+
+@testset "Superposition algebra" begin
+    g0, g1, g2 = Level("0"), Level("1"), Level("2")
+
+    # keys are always bare levels, never a nested Superposition
+    flat(s) = all(k -> !(k isa AtomTwin.Superposition), keys(s.coeffs))
+
+    # scalar × (sum)
+    s = (1/√2) * (g0 + g1)
+    @test flat(s)
+    @test Set(keys(s.coeffs)) == Set([g0, g1])
+    @test s.coeffs[g0] ≈ 1/√2
+    @test s.coeffs[g1] ≈ 1/√2
+
+    # division and the a*ℓ1 + b*ℓ2 form agree
+    s2 = (g0 + g1) / √2
+    @test flat(s2)
+    @test s2.coeffs[g0] ≈ 1/√2
+    @test s2.coeffs[g1] ≈ 1/√2
+
+    s3 = (1/√2)*g0 + (1/√2)*g1
+    @test s3.coeffs[g0] ≈ 1/√2
+    @test s3.coeffs[g1] ≈ 1/√2
+
+    # right-multiply commutes; unary minus; nested scaling
+    @test (g0 * 2).coeffs[g0] ≈ 2
+    @test (-g0).coeffs[g0] ≈ -1
+    @test (2 * (g0 + g1)).coeffs[g0] ≈ 2
+    @test ((g0 + g1) * 3).coeffs[g1] ≈ 3
+
+    # a richer expression with cancellation collapses correctly
+    s4 = 2*g0 - 0.5*g1 + 0.5*g1            # the g1 terms cancel
+    @test flat(s4)
+    @test s4.coeffs[g0] ≈ 2
+    @test get(s4.coeffs, g1, 0.0) ≈ 0.0 atol=1e-12
+
+    # three-level normalised state
+    s5 = (g0 + g1 + g2) / √3
+    @test flat(s5)
+    @test all(abs(s5.coeffs[l]) ≈ 1/√3 for l in (g0, g1, g2))
+
+    # getqstate places the coefficients on the right basis indices and normalises.
+    atom = Atom(; levels = [g0, g1, g2])
+    sys  = System(atom)
+    ψ = getqstate(sys, (1/√2)*g0 + (1/√2)*g1)
+    @test length(ψ) == 3
+    @test abs(ψ[atom.level_indices[g0]]) ≈ 1/√2
+    @test abs(ψ[atom.level_indices[g1]]) ≈ 1/√2
+    @test abs(ψ[atom.level_indices[g2]]) ≈ 0 atol=1e-12
+    @test ψ'ψ ≈ 1
+end
+
+# ======================================================================
+# Term symbols
+# ======================================================================
+
+@testset "term symbols bind levels to species data" begin
+    # `label` is display text ("³P₀"); the model is found by `term` ("3P0"),
+    # resolved at parse time.
+    @test (l"3P1").J == 1//1
+    @test (l"1S0").J == 0//1
+    @test AtomTwin.Ytterbium171._3P1 === l"3P1"   # species-qualified: same object
+    @test AtomTwin.Strontium88._1S0  === l"1S0"   # a term is the state, not the atom
+    @test_throws Exception eval(:(@l_str "3Q9"))  # unknown term fails where written
+
+    # A term propagates to every sublevel, and `label` stays cosmetic.
+    e = HyperfineManifold(1//1, 1; label = "³P₁", term = l"3P1")
+    @test e.term == "3P1"
+    @test all(l -> l.term == "3P1" && l.label == "³P₁", e.levels)
+    @test FineManifold(1//1; term = l"3P1").term == "3P1"
+
+    # A term knows its own J, so HyperfineManifold(F, J) with the arguments
+    # swapped is an error at the point of declaration.
+    @test_throws ErrorException HyperfineManifold(1//1, 0; term = l"3P1")
+
+    # Nothing pre-term changes: a bare Level's label doubles as its term, the
+    # positional constructors still work, and a String is still accepted.
+    @test AtomTwin._level_term(Level("1S0")) == "1S0"
+    @test AtomTwin._level_term(Level("ground"; term = l"1S0")) == "1S0"
+    @test copy(Level("g"; term = l"1S0")).term == "1S0"
+    @test HyperfineLevel(1//1, 1//1, 0//1, 1.0, "x").term == ""
+    @test FineLevel(1//1, 0//1, 1.0, "x").term == ""
+    @test HyperfineManifold(1//1, 1; term = "3P1").term == "3P1"
+end

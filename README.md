@@ -3,7 +3,7 @@
 [![CI](https://github.com/aQCess/AtomTwin.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/aQCess/AtomTwin.jl/actions/workflows/CI.yml)
 [![Docs](https://img.shields.io/badge/docs-stable-blue.svg)](https://aQCess.github.io/AtomTwin.jl/stable/)
 
-AtomTwin is an open‑source **quantum EDA and physics level digital‑twin framework for neutral‑atom quantum processors**, focused on realistic, physics‑first simulation of atoms, tweezers, and laser control, including atomic motion, realistic level structures, laser noise, and more. While the primary focus is on neutral‑atom arrays, AtomTwin can model a broad class of atomic quantum systems driven by laser fields, including trapped ions, atomic clocks, quantum memories, interfaces, and sensors. It enables hardware and firmware developers to design, test, and validate low‑level, firmware‑like instructions without manually specifying Hamiltonians, bridging ideas to hardware‑realistic control sequences in a single environment. **AtomTwin sits between textbook models and lab hardware, providing vendor‑agnostic, physics‑level digital twins of atomic quantum devices rather than a generic circuit‑level or Hamiltonian‑only simulator.**
+AtomTwin is an open‑source **quantum EDA and physics level digital‑twin for neutral‑atom quantum processors**, focused on realistic, physics‑first simulation of atoms, tweezers, and laser control, including atomic motion, realistic level structures, laser noise, and more. While the primary focus is on neutral‑atom arrays, AtomTwin can model a broad class of atomic quantum systems driven by laser fields, including trapped ions, atomic clocks, quantum memories, interfaces, and sensors. It enables hardware and firmware developers to design, test, and validate low‑level, firmware‑like instructions without manually specifying Hamiltonians, bridging ideas to hardware‑realistic control sequences in a single environment. **AtomTwin sits between textbook models and lab hardware, providing vendor‑agnostic, physics‑level digital twins of atomic quantum devices rather than a generic circuit‑level or Hamiltonian‑only simulator.**
 
 > **Status:** beta
 > **Homepage / Docs:** https://aQCess.github.io/AtomTwin.jl/stable/
@@ -23,11 +23,12 @@ AtomTwin is an open‑source **quantum EDA and physics level digital‑twin fram
 
 - **Physics‑first modeling in Julia** for fast, composable simulation code with an accessible, research‑friendly syntax.
 - **Atom / tweezer / laser primitives** so you build simulations directly from physical components instead of abstract Hamiltonians.
-- **High‑performance engines for coupled quantum and classical dynamics** at the pulse level.
+- **Error‑controlled engines for coupled quantum and classical dynamics** at the pulse level: Schrödinger, wavefunction Monte Carlo and master‑equation solvers, each with semiclassical atomic motion.
 - **Firmware‑like instruction sequences** that mimic execution on real neutral‑atom processors.
-- **Ready‑to‑use models for common atomic species** (e.g. ytterbium), easily extended to new level schemes.
+- **Light–matter physics from atomic data**: trap light shifts with full tensor polarizability, state‑dependent potentials, radiation pressure and photon recoil for laser cooling and fluorescence imaging.
+- **Ready‑to‑use species** (Yb‑171, Yb‑174, Sr‑88, Rb‑87, K‑39) with polarizability models, easily extended to new level schemes.
 - **Visualization hooks** for atomic trajectories and quantum state evolution (ideal for debugging and teaching).
-- Interactive notebook workflows for exploring key quantum protocols in a reproducible way.
+- Worked examples covering gates, noise, state preparation, transport, spectroscopy and laser cooling.
 - Suitable for independent research and for use in courses, labs, and workshops on neutral‑atom platforms.
 
 Planned future directions include a **quantum SDK for instruction‑level control**, a **CAE/EDA‑style environment** for hardware engineers, and a **physics backend for digital twins** of neutral‑atom processors such as the aQCess QPU in Strasbourg.
@@ -46,7 +47,7 @@ AtomTwin is a Julia package distributed via the General registry.
 
 ### Install Julia with juliaup  
 >
-> `juliaup` is the recommended way to install and manage Julia on all major platforms.[1][2][3]
+> `juliaup` is the recommended way to install and manage Julia on all major platforms.
 >
 > - **Windows**: Install “Julia” from the Microsoft Store or via the Windows package manager (`winget`), which also installs `juliaup`. Then open a new terminal and run `julia` to start the Julia REPL.
 > - **Linux**: Use your distribution’s instructions for installing `juliaup` (typically a single shell command from the official Julia download page), then open a terminal and run `julia`.
@@ -111,7 +112,7 @@ system = System(atom)
 add_coupling!(system, atom, g => e, 2π * 1e6)  # 1 MHz Rabi frequency
 add_detector!(system, PopulationDetectorSpec(atom, e; name = "P_e"))
 
-seq = Sequence(1e-9)   # 1 ns time step
+seq = Sequence(1e-9)   # output every 1 ns
 @sequence seq begin
     Wait(5e-6)         # 5 μs
 end
@@ -151,12 +152,13 @@ AtomTwin aims to grow into:
 
 ## Documentation
 
-Full documentation, including tutorials, API reference, and example notebooks, is available at: https://aQCess.github.io/AtomTwin.jl/stable/
+Full documentation, including worked examples, the API reference and a guide to the solvers, is available at: https://aQCess.github.io/AtomTwin.jl/stable/
 
 Key entry points:
 
 - **Getting started**: basic workflows and core concepts (atoms, tweezers, lasers, sequences, detectors).
-- **Examples**: driven two‑level systems, Rabi oscillations with noise, tweezer arrays, instruction‑level protocols.
+- **Solvers and accuracy**: how `dt`, `tol`, motion and light shifts are handled.
+- **Examples**: Rabi oscillations with noise, Rydberg gates, tweezer arrays and atom sorting, spectroscopy, laser cooling.
 - **API reference**: types and functions for building systems, sequences, and detectors.
 
 ---
@@ -167,7 +169,7 @@ AtomTwin welcomes contributors, especially users working with neutral‑atom har
 
 - Expanding atomic physics data to include new atomic species and level schemes.
 - Validation of models for traps, lasers, and noise.
-- Performance improvements, e.g. adaptive steps and GPU acceleration.
+- Performance improvements, e.g. GPU acceleration.
 - Documentation, tutorials, and teaching materials.
 - Integrations with other quantum‑software ecosystems.
 
@@ -195,17 +197,8 @@ AtomTwin has received support from:
 
 If you use AtomTwin in research or teaching, please cite the software directly:
 
-```
-@misc{whitlock2026atomtwinjlphysicsnativedigitaltwin,
-      title={AtomTwin.jl: a physics-native digital twin framework for neutral-atom quantum processors}, 
-      author={Shannon Whitlock},
-      year={2026},
-      eprint={2604.18531},
-      archivePrefix={arXiv},
-      primaryClass={quant-ph},
-      url={https://arxiv.org/abs/2604.18531}, 
-}
-```
+> AtomTwin.jl, version X.Y.Z, University of Strasbourg, 2026.
+> URL: https://github.com/aQCess/AtomTwin.jl
 
 ## License
 
@@ -216,4 +209,5 @@ AtomTwin is released under the Apache-2.0 license; see `LICENSE` for details.
 ## Contact
 
 - Lead maintainer: Shannon Whitlock, University of Strasbourg 
+- Lab / group: https://whitlockscientific.com
 - Project website: https://github.com/aQCess/AtomTwin.jl

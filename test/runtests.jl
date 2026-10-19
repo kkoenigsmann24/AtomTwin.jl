@@ -3,7 +3,6 @@ using AtomTwin
 using Printf
 using Random
 using Statistics
-using StatsBase
 
 unit_dir = joinpath(@__DIR__, "unit")
 
@@ -13,6 +12,10 @@ end
 
 @testset "Sequence" begin
     include(joinpath(unit_dir, "test_sequence.jl"))
+end
+
+@testset "Levels" begin
+    include(joinpath(unit_dir, "test_levels.jl"))
 end
 
 @testset "System" begin
@@ -29,6 +32,14 @@ end
 
 @testset "Motion" begin
     include(joinpath(unit_dir, "test_motion.jl"))
+end
+
+@testset "Thread workspaces" begin
+    include(joinpath(unit_dir, "test_thread_workspaces.jl"))
+end
+
+@testset "Solver order" begin
+    include(joinpath(unit_dir, "test_solver_order.jl"))
 end
 
 @testset "Paper listings" begin
@@ -61,7 +72,7 @@ function run_example(path; min_shots::Int = 10, max_shots::Int = 100, time_limit
     best_runtime    = Inf
     first_elapsed   = Inf
     total_time      = 0.0
-    total_runtime   = 0.0  # New: sum of all runtimes
+    total_runtime   = 0.0
     first_cs        = UInt(0)
     first_desc      = ""
 
@@ -75,7 +86,7 @@ function run_example(path; min_shots::Int = 10, max_shots::Int = 100, time_limit
 
 
         runtime, cs, desc = run_one_shot()
-        total_runtime += runtime  # New: accumulate runtime
+        total_runtime += runtime
         
         if n_shots == 1
             first_elapsed = t
@@ -95,9 +106,12 @@ function run_example(path; min_shots::Int = 10, max_shots::Int = 100, time_limit
     end
 
 
-    build_time = first_elapsed - best_runtime
-    avg_runtime = total_runtime / n_shots  # New: compute average
-    return build_time, best_runtime, avg_runtime, first_cs, first_desc
+    # Everything the script does outside its own `runtime` block on the first
+    # include: setup, compilation latency, and any further physics after the
+    # timed block (process tomography, plotting). Not build time.
+    other_time = first_elapsed - best_runtime
+    avg_runtime = total_runtime / n_shots
+    return other_time, best_runtime, avg_runtime, first_cs, first_desc
 end
 
 
@@ -108,15 +122,30 @@ examples = [
     joinpath(ex_path, "rabi_with_motion.jl"),
     joinpath(ex_path, "rabi_with_static_intensity_noise.jl"),
     joinpath(ex_path, "rydberg_blockade.jl"),
+    joinpath(ex_path, "two_qubit_exchange.jl"),
     joinpath(ex_path, "time-optimal_rydberg_gate.jl"),
     joinpath(ex_path, "yb171_raman_gate.jl"),
     joinpath(ex_path, "k39_state_prep.jl"),
     joinpath(ex_path, "gateX_tomography.jl"),
     joinpath(ex_path, "eit_with_dissipation.jl"),
     joinpath(ex_path, "atom_sorting.jl"),
+    joinpath(ex_path, "yb174_tweezer_cooling.jl"),
 ]
 
 RUN_EXAMPLES = get(ENV, "ATOMTWIN_RUN_EXAMPLES", "false") == "true"
+
+# `Pkg.test` forces `--check-bounds=yes`, which overrides every `@inbounds` in
+# the package -- including the solver hot loops -- so the runtimes below come out
+# roughly 2.5x their real value. Harmless for the checksums, misleading for the
+# timings, and silent unless we say so.
+if RUN_EXAMPLES && Base.JLOptions().check_bounds == 1
+    @info """
+    Bounds checking is forced on; the example runtimes below are ~2.5x inflated.
+    For real timings:
+
+        Pkg.test("AtomTwin"; julia_args = ["--check-bounds=auto"])
+    """
+end
 
 if RUN_EXAMPLES; @testset "Example scripts" begin
     rows = String[]
@@ -133,7 +162,7 @@ if RUN_EXAMPLES; @testset "Example scripts" begin
     end
 
     println()
-    println(rpad("Example", 40), "    best[s]    avg[s]   build[s]   checksum")
+    println(rpad("Example", 40), "    best[s]    avg[s]   other[s]   checksum")
     println(repeat("-", 40 + 2 + 10 + 2 + 10 + 2 + 18))
     for row in rows
         println(row)

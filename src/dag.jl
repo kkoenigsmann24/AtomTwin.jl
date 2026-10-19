@@ -31,7 +31,6 @@ inside nodes (e.g. `BeamRabiFrequency`, `GaussianPosition`, `MaxwellBoltzmann`).
 Nodes appear in `sys.nodes` and are topologically sorted by `compile` before
 each simulation; insertion order is preserved for independent nodes.
 """
-
 abstract type AbstractNode end
 
 """Return the compiled output of a node (nothing if not yet built)."""
@@ -120,49 +119,12 @@ CouplingNode(Ω, atom, transition; active=true) =
 
 node_output(n::CouplingNode) = n._field
 
-function build_node!(node::CouplingNode, basis::Basis)
-    node._field === nothing || return node._field
-    Ω_val = ComplexF64(_resolve_node_default(node.Ω))
-    idx1  = node.atom.level_indices[node.transition[1]]
-    idx2  = node.atom.level_indices[node.transition[2]]
-    c = GlobalCoupling(basis, node.atom.inner, idx1 => idx2, Ω_val)
-    c._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
-    node._field = c
-    return c
-end
+_rate_value(n::CouplingNode) = n.Ω
 
-function compile_node!(node::CouplingNode, basis::Basis, rng, param_values)
-    Ω_val = ComplexF64(_resolve_node_value(node.Ω, param_values, rng))
-    if node._field === nothing
-        idx1 = node.atom.level_indices[node.transition[1]]
-        idx2 = node.atom.level_indices[node.transition[2]]
-        c = GlobalCoupling(basis, node.atom.inner, idx1 => idx2, Ω_val)
-        c._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
-        node._field = c
-    elseif node._field.rate == 0 && Ω_val != 0
-        # Previous rate was zero — can't rescale from zero; rebuild H in-place.
-        idx1 = node.atom.level_indices[node.transition[1]]
-        idx2 = node.atom.level_indices[node.transition[2]]
-        new_op = Op(basis, node.atom.inner, idx1 => idx2, Ω_val / 2)
-        copy!(node._field.H.forward, new_op.forward)
-        copy!(node._field.H.reverse, new_op.reverse)
-        node._field.rate = Ω_val
-    else
-        update!(node._field, Val(:_), Ω_val)
-    end
-    return node._field
-end
-
-function recompile_node!(node::CouplingNode, c::GlobalCoupling, rng, param_values)
-    Ω_val = ComplexF64(_resolve_node_value(node.Ω, param_values, rng))
-    if c.rate == 0 && Ω_val != 0
-        copy!(c.H.forward, node._field.H.forward)
-        copy!(c.H.reverse, node._field.H.reverse)
-        c.rate = node._field.rate
-        update!(c, Val(:_), Ω_val)
-    else
-        update!(c, Val(:_), Ω_val)
-    end
+function _new_field(node::CouplingNode, basis::Basis, Ω::ComplexF64)
+    idx1 = node.atom.level_indices[node.transition[1]]
+    idx2 = node.atom.level_indices[node.transition[2]]
+    return GlobalCoupling(basis, node.atom.inner, idx1 => idx2, Ω)
 end
 
 #=============================================================================
@@ -174,10 +136,13 @@ GAUSSIAN COUPLING NODE  (position-dependent Rabi frequency)
 
 Node for a spatially-varying coupling driven by a `GaussianBeam` or `GeneralGaussianBeam`.
 
-Peak Rabi frequency Ω₀ is computed at build time from `rabi_frequency(...)` unless
-`Ω0_override` is provided (useful when E1 selection rules underestimate the effective
-coupling due to state mixing). Each solver timestep `update!` rescales `_coeff` by the
-ratio of the current to build-time field scalar.
+Peak Rabi frequency Ω₀ is computed from `rabi_frequency(...)` at the atom's position
+unless `Ω0_override` is provided (useful when E1 selection rules underestimate the
+effective coupling due to state mixing). An override is the Rabi frequency at the
+beam's reference point `beam.r0` (its focus) and may be a number, `Parameter` or
+`ParametricExpression`. Either way the coupling then follows the field at the atom:
+each solver timestep `update!` rescales `_coeff` by the ratio of the current to
+compile-time field scalar.
 """
 mutable struct GaussianCouplingNode <: AbstractNode
     atom::AbstractAtom
@@ -187,7 +152,7 @@ mutable struct GaussianCouplingNode <: AbstractNode
     d_red::Float64
     g::Any
     e::Any
-    Ω0_override::Union{Nothing, ComplexF64}
+    Ω0_override::Any        # nothing, or the Rabi frequency at beam.r0
     active::Bool
     _field::Union{Nothing, GaussianCoupling}
 end
@@ -199,46 +164,53 @@ GaussianCouplingNode(atom, transition, beam, q_axis, d_red, g, e;
 
 node_output(n::GaussianCouplingNode) = n._field
 
+# Rabi frequency at position `x`: from the beam's field and `d_red`, or an override
+# `Ωref` given at the beam's reference point and carried to `x` by the field ratio.
+function _gaussian_Ω0(node::GaussianCouplingNode, x, Ωref)
+    Ωref === nothing &&
+        return ComplexF64(rabi_frequency(node.atom, node.g, node.e, node.beam, x;
+                                         q_axis = node.q_axis, d_red = node.d_red))
+    r_ref = hasproperty(node.beam, :r0) ? Vector{Float64}(node.beam.r0) : zeros(3)
+    E_ref = Dynamiq.efield_scalar(node.beam, r_ref)
+    iszero(E_ref) && return ComplexF64(Ωref)
+    return ComplexF64(Ωref) * Dynamiq.efield_scalar(node.beam, x) / E_ref
+end
+
 function build_node!(node::GaussianCouplingNode, basis::Basis)
     node._field === nothing || return node._field
     idx1 = node.atom.level_indices[node.transition[1]]
     idx2 = node.atom.level_indices[node.transition[2]]
-    Ω0 = node.Ω0_override !== nothing ? node.Ω0_override :
-         ComplexF64(rabi_frequency(node.atom, node.g, node.e, node.beam, node.atom.x;
-                                   q_axis = node.q_axis, d_red = node.d_red))
+    Ωref = node.Ω0_override === nothing ? nothing : _resolve_node_default(node.Ω0_override)
+    Ω0 = _gaussian_Ω0(node, node.atom.x, Ωref)
     c = GaussianCoupling(basis, node.atom.inner, idx1 => idx2, node.beam, Ω0)
     c._amplitude[] = node.active ? ComplexF64(1.0) : ComplexF64(0.0)
     node._field = c
     return c
 end
 
-function compile_node!(node::GaussianCouplingNode, basis::Basis, ::Any, ::Any)
-    c = node._field
-    c === nothing && return build_node!(node, basis)
-    if node.Ω0_override === nothing
-        # Recompute Ω₀ and E₀ at current atom position (may differ between shots)
-        Ω0 = ComplexF64(rabi_frequency(node.atom, node.g, node.e, node.beam, node.atom.x;
-                                       q_axis = node.q_axis, d_red = node.d_red))
-        update!(c, Val(:_), Ω0)   # rescale H entries in-place
-        c.E0 = ComplexF64(Dynamiq.efield_scalar(node.beam, node.atom.x))
-    end
-    # Override: Ω0/E0 ratio fixed at build time; only reset amplitude
+# Ω₀ and E₀ at the atom's position for this shot (it may differ between shots),
+# with a parametric override resampled.
+function _refresh_gaussian!(node::GaussianCouplingNode, c::GaussianCoupling, x,
+                            param_values, rng)
+    Ωref = node.Ω0_override === nothing ? nothing :
+           _resolve_node_value(node.Ω0_override, param_values, rng)
+    update!(c, Val(:_), _gaussian_Ω0(node, x, Ωref))   # rescale H entries in-place
+    c.E0 = ComplexF64(Dynamiq.efield_scalar(node.beam, x))
     c._amplitude[] = node.active ? ComplexF64(1.0) : ComplexF64(0.0)
     return c
 end
 
-function recompile_node!(node::GaussianCouplingNode, ::GaussianCoupling, ::Any, ::Any)
+function compile_node!(node::GaussianCouplingNode, basis::Basis, rng, param_values)
     c = node._field
-    c === nothing && error("GaussianCouplingNode not compiled before recompile!")
-    if node.Ω0_override === nothing
-        Ω0 = ComplexF64(rabi_frequency(node.atom, node.g, node.e, node.beam, node.atom.x;
-                                       q_axis = node.q_axis, d_red = node.d_red))
-        update!(c, Val(:_), Ω0)
-        c.E0 = ComplexF64(Dynamiq.efield_scalar(node.beam, node.atom.x))
-    end
-    c._amplitude[] = node.active ? ComplexF64(1.0) : ComplexF64(0.0)
-    return c
+    c === nothing && return build_node!(node, basis)
+    return _refresh_gaussian!(node, c, node.atom.x, param_values, rng)
 end
+
+# Updates `c`, the JOB's field, at the job's atom position `c.atom.x`. Not
+# `node._field` and `node.atom`: a multi-threaded run gives each thread a deep
+# copy of the job, and only that copy was re-initialised for this shot.
+recompile_node!(node::GaussianCouplingNode, c::GaussianCoupling, rng, param_values) =
+    _refresh_gaussian!(node, c, c.atom.x, param_values, rng)
 
 #=============================================================================
 NOISY COUPLING NODE  (NoisyField wrapping GlobalCoupling)
@@ -314,58 +286,19 @@ mutable struct PlanarCouplingNode <: AbstractNode
     beam::PlanarBeam
     active::Bool
     _field::Union{Nothing, PlanarCoupling}
-    _current_rate::ComplexF64
 end
 
 PlanarCouplingNode(Ω, atom, transition, beam; active=true) =
-    PlanarCouplingNode(Ω, atom, transition, beam, active, nothing, zero(ComplexF64))
+    PlanarCouplingNode(Ω, atom, transition, beam, active, nothing)
 
 node_output(n::PlanarCouplingNode) = n._field
 
-function _rescale_planar!(c::PlanarCoupling, new_rate::ComplexF64, old_rate::ComplexF64)
-    if old_rate != 0
-        scale = new_rate / old_rate
-        for k in eachindex(c.H.forward)
-            i, j, v = c.H.forward[k]
-            c.H.forward[k] = (i, j, v * scale)
-        end
-        for k in eachindex(c.H.reverse)
-            i, j, v = c.H.reverse[k]
-            c.H.reverse[k] = (i, j, v * scale)
-        end
-    end
-end
+_rate_value(n::PlanarCouplingNode) = n.Ω
 
-function build_node!(node::PlanarCouplingNode, basis::Basis)
-    node._field === nothing || return node._field
-    Ω_val = ComplexF64(_resolve_node_default(node.Ω))
-    idx1  = node.atom.level_indices[node.transition[1]]
-    idx2  = node.atom.level_indices[node.transition[2]]
-    c = PlanarCoupling(basis, node.atom.inner, idx1 => idx2, Ω_val, node.beam)
-    c._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
-    node._field = c
-    node._current_rate = Ω_val
-    return c
-end
-
-function compile_node!(node::PlanarCouplingNode, basis::Basis, rng, param_values)
-    Ω_val = ComplexF64(_resolve_node_value(node.Ω, param_values, rng))
-    if node._field === nothing
-        idx1 = node.atom.level_indices[node.transition[1]]
-        idx2 = node.atom.level_indices[node.transition[2]]
-        c = PlanarCoupling(basis, node.atom.inner, idx1 => idx2, Ω_val, node.beam)
-        c._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
-        node._field = c
-    else
-        _rescale_planar!(node._field, Ω_val, node._current_rate)
-    end
-    node._current_rate = Ω_val
-    return node._field
-end
-
-function recompile_node!(node::PlanarCouplingNode, c::PlanarCoupling, rng, param_values)
-    Ω_val = ComplexF64(_resolve_node_value(node.Ω, param_values, rng))
-    _rescale_planar!(c, Ω_val, node._current_rate)
+function _new_field(node::PlanarCouplingNode, basis::Basis, Ω::ComplexF64)
+    idx1 = node.atom.level_indices[node.transition[1]]
+    idx2 = node.atom.level_indices[node.transition[2]]
+    return PlanarCoupling(basis, node.atom.inner, idx1 => idx2, Ω, node.beam)
 end
 
 #=============================================================================
@@ -420,6 +353,51 @@ function recompile_node!(node::DetuningNode, d::Detuning, rng, param_values)
 end
 
 #=============================================================================
+HAMILTONIAN NODE  (Hamiltonian — operator supplied directly)
+=============================================================================#
+
+"""
+    HamiltonianNode
+
+Node for a Hamiltonian term supplied as an explicit operator (see
+[`add_hamiltonian!`](@ref)). `H` is a concrete `Op` already dimensioned to the
+system basis; the node simply wraps it in a [`Hamiltonian`](@ref) field. The
+operator is parameter-free (materialised at `add_hamiltonian!` time), so
+compile/recompile only toggle the active coefficient.
+"""
+mutable struct HamiltonianNode <: AbstractNode
+    H::Op
+    active::Bool
+    _field::Union{Nothing, Hamiltonian}
+end
+
+HamiltonianNode(H::Op; active=true) = HamiltonianNode(H, active, nothing)
+
+node_output(n::HamiltonianNode) = n._field
+
+function build_node!(node::HamiltonianNode, basis::Basis)
+    node._field === nothing || return node._field
+    h = Hamiltonian(node.H)
+    h._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
+    node._field = h
+    return h
+end
+
+function compile_node!(node::HamiltonianNode, basis::Basis, rng, param_values)
+    if node._field === nothing
+        h = Hamiltonian(node.H)
+        h._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
+        node._field = h
+    end
+    return node._field
+end
+
+function recompile_node!(node::HamiltonianNode, h::Hamiltonian, rng, param_values)
+    # Operator is static and parameter-free; nothing to resample.
+    return h
+end
+
+#=============================================================================
 DECAY NODE  (Jump)
 =============================================================================#
 
@@ -427,46 +405,52 @@ DECAY NODE  (Jump)
     DecayNode
 
 Node for a spontaneous decay or dephasing jump operator. `Gamma` is the
-decay rate in rad/s.
+decay rate in rad/s. `clicks` optionally holds the name of a `PhotoDetector`
+(from a `PhotoDetectorSpec`) to which this jump's events are reported, so its
+firings are counted as photon clicks; `nothing` means no photon detector.
+`branches` lists every `(e => g) => amplitude` of a jump that decays several
+levels coherently (see [`Jump`](@ref)); `transition` is the first.
 """
 mutable struct DecayNode <: AbstractNode
     Gamma::Any
     atom::AbstractAtom
     transition::Pair{<:AbstractLevel, <:AbstractLevel}
     active::Bool
+    clicks::Union{Nothing, String}
     _field::Union{Nothing, Jump}
+    branches::Vector{<:Pair{<:Pair, Float64}}
 end
 
-DecayNode(Gamma, atom, transition; active=true) =
-    DecayNode(Gamma, atom, transition, active, nothing)
+DecayNode(Gamma, atom, transition; active=true, clicks=nothing, branches=[transition => 1.0]) =
+    DecayNode(Gamma, atom, first(branches).first, active, clicks, nothing, branches)
 
 node_output(n::DecayNode) = n._field
 
+function _jump(node::DecayNode, basis::Basis, Gamma_val)
+    idx = node.atom.level_indices
+    j = Jump(basis, node.atom.inner, [(idx[e] => idx[g]) => c for ((e, g), c) in node.branches], Gamma_val)
+    j._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
+    return j
+end
+
 function build_node!(node::DecayNode, basis::Basis)
     node._field === nothing || return node._field
-    Gamma_val = _resolve_node_default(node.Gamma)
-    idx1 = node.atom.level_indices[node.transition[1]]
-    idx2 = node.atom.level_indices[node.transition[2]]
-    j = Jump(basis, node.atom.inner, idx1 => idx2, Gamma_val)
-    j._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
-    node._field = j
-    return j
+    node._field = _jump(node, basis, _resolve_node_default(node.Gamma))
+    return node._field
 end
 
 function compile_node!(node::DecayNode, basis::Basis, rng, param_values)
     Gamma_val = _resolve_node_value(node.Gamma, param_values, rng)
     if node._field === nothing || (node._field._rate == 0 && Gamma_val != 0)
-        idx1 = node.atom.level_indices[node.transition[1]]
-        idx2 = node.atom.level_indices[node.transition[2]]
-        j = Jump(basis, node.atom.inner, idx1 => idx2, Gamma_val)
-        j._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
-        node._field = j
+        node._field = _jump(node, basis, Gamma_val)
     else
         update!(node._field, Val(:_), Gamma_val)
     end
     return node._field
 end
 
+# A no-op unless the rate changed (a sampled rate): `update!` then clears the
+# cached L†L, which `evolve!` rebuilds.
 function recompile_node!(node::DecayNode, j::Jump, rng, param_values)
     Gamma_val = _resolve_node_value(node.Gamma, param_values, rng)
     if j._rate == 0 && Gamma_val != 0
@@ -474,6 +458,7 @@ function recompile_node!(node::DecayNode, j::Jump, rng, param_values)
         j._rate = node._field._rate
     end
     update!(j, Val(:_), Gamma_val)
+    return j
 end
 
 #=============================================================================
@@ -492,75 +477,70 @@ mutable struct InteractionNode <: AbstractNode
     transition::Pair          # (from_tuple => to_tuple) of level tuples
     active::Bool
     _field::Union{Nothing, Interaction}
-    _current_value::ComplexF64
 end
 
 InteractionNode(V, atoms, transition; active=true) =
-    InteractionNode(V, atoms, transition, active, nothing, zero(ComplexF64))
+    InteractionNode(V, atoms, transition, active, nothing)
 
 node_output(n::InteractionNode) = n._field
 
 function _interaction_transitions(node::InteractionNode)
     atom1, atom2 = node.atoms
-    from_tuple = node.transition.first
-    t1 = atom1.level_indices[from_tuple[1]] => atom1.level_indices[from_tuple[2]]
-    t2 = atom2.level_indices[from_tuple[1]] => atom2.level_indices[from_tuple[2]]
+    from_tuple, to_tuple = node.transition.first, node.transition.second
+    # `(from1, from2) => (to1, to2)`: atom1 does from1→to1, atom2 does from2→to2.
+    # The diagonal form `(a,b) => (a,b)` gives the projector |ab⟩⟨ab|; an
+    # off-diagonal form like `(0,1) => (1,0)` gives the exchange σ₁⁺σ₂⁻ + h.c.
+    t1 = atom1.level_indices[from_tuple[1]] => atom1.level_indices[to_tuple[1]]
+    t2 = atom2.level_indices[from_tuple[2]] => atom2.level_indices[to_tuple[2]]
     return t1, t2
 end
 
-function _rescale_interaction!(inter::Interaction, new_val::ComplexF64, old_val::ComplexF64)
-    if old_val != 0
-        scale = new_val / old_val
-        for k in eachindex(inter.H.forward)
-            i, j, v = inter.H.forward[k]; inter.H.forward[k] = (i, j, v * scale)
-        end
-        for k in eachindex(inter.H.reverse)
-            i, j, v = inter.H.reverse[k]; inter.H.reverse[k] = (i, j, v * scale)
-        end
-    end
-end
+_rate_value(n::InteractionNode) = n.V
 
-function build_node!(node::InteractionNode, basis::Basis)
-    node._field === nothing || return node._field
-    V_val = ComplexF64(_resolve_node_default(node.V))
+function _new_field(node::InteractionNode, basis::Basis, V::ComplexF64)
     atom1, atom2 = node.atoms
     t1, t2 = _interaction_transitions(node)
-    inter = Interaction(basis, atom1.inner => atom2.inner, t1, t2, V_val)
-    inter._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
-    node._field = inter
-    node._current_value = V_val
-    return inter
+    return Interaction(basis, atom1.inner => atom2.inner, t1, t2, V)
 end
 
-function compile_node!(node::InteractionNode, basis::Basis, rng, param_values)
-    V_val = ComplexF64(_resolve_node_value(node.V, param_values, rng))
-    if node._field === nothing
-        atom1, atom2 = node.atoms
-        t1, t2 = _interaction_transitions(node)
-        inter = Interaction(basis, atom1.inner => atom2.inner, t1, t2, V_val)
-        inter._coeff[] = ComplexF64(node.active ? 1.0 : 0.0)
-        node._field = inter
-    elseif node._current_value == 0 && V_val != 0
-        atom1, atom2 = node.atoms
-        t1, t2 = _interaction_transitions(node)
-        new_op = Op(basis, atom1.inner => atom2.inner, t1, t2, V_val)
-        copy!(node._field.H.forward, new_op.forward)
-        copy!(node._field.H.reverse, new_op.reverse)
+#=============================================================================
+RATE-CARRYING NODES  (CouplingNode, PlanarCouplingNode, InteractionNode)
+
+Each builds a field whose strength is baked into its operator and recorded in
+`field.rate`; a new value rescales the operator in place (`update!`). They
+differ only in the field they build (`_new_field`) and where the rate is
+declared (`_rate_value`).
+=============================================================================#
+
+const RatedNode = Union{CouplingNode, PlanarCouplingNode, InteractionNode}
+
+function build_node!(node::RatedNode, basis::Basis)
+    node._field === nothing || return node._field
+    f = _new_field(node, basis, ComplexF64(_resolve_node_default(_rate_value(node))))
+    _reset_activity!(node, f)
+    return node._field = f
+end
+
+function compile_node!(node::RatedNode, basis::Basis, rng, param_values)
+    rate = ComplexF64(_resolve_node_value(_rate_value(node), param_values, rng))
+    f = node._field
+    if f === nothing
+        f = node._field = _new_field(node, basis, rate)
+        _reset_activity!(node, f)
+    elseif f.rate == 0 && rate != 0
+        # A zero-rate operator has zero entries and cannot be rescaled: rebuild.
+        fresh = _new_field(node, basis, rate)
+        copy!(f.H.forward, fresh.H.forward)
+        copy!(f.H.reverse, fresh.H.reverse)
+        f.rate = rate
     else
-        _rescale_interaction!(node._field, V_val, node._current_value)
+        update!(f, Val(:_), rate)
     end
-    node._current_value = V_val
-    return node._field
+    return f
 end
 
-function recompile_node!(node::InteractionNode, inter::Interaction, rng, param_values)
-    V_val = ComplexF64(_resolve_node_value(node.V, param_values, rng))
-    if node._current_value == 0 && V_val != 0
-        copy!(inter.H.forward, node._field.H.forward)
-        copy!(inter.H.reverse, node._field.H.reverse)
-    end
-    _rescale_interaction!(inter, V_val, node._current_value)
-end
+recompile_node!(node::RatedNode, f, rng, param_values) =
+    _set_rate!(f, node._field, ComplexF64(_resolve_node_value(_rate_value(node), param_values, rng)))
 
 #=============================================================================
 VdW INTERACTION NODE  (distance-dependent C6/r^6 interaction)
@@ -581,12 +561,11 @@ mutable struct VdWInteractionNode <: AbstractNode
     transition::Pair
     active::Bool
     _field::Union{Nothing, VdWInteraction}
-    _current_value::ComplexF64
     V_cap::Float64
 end
 
 VdWInteractionNode(C6, atoms, transition; active = true, V_cap = Inf) =
-    VdWInteractionNode(C6, atoms, transition, active, nothing, zero(ComplexF64), Float64(V_cap))
+    VdWInteractionNode(C6, atoms, transition, active, nothing, Float64(V_cap))
 
 node_output(n::VdWInteractionNode) = n._field
 
@@ -605,9 +584,8 @@ function build_node!(node::VdWInteractionNode, basis::Basis)
     t1, t2 = _vdw_transitions(node)
     inter = VdWInteraction(basis, atom1.inner => atom2.inner, t1, t2, C6_val;
                            V_cap = node.V_cap)
-    inter._coeff[] = node.active ? ComplexF64(C6_val) : ComplexF64(0)
+    inter._amplitude[] = node.active ? 1.0 : 0.0
     node._field = inter
-    node._current_value = ComplexF64(C6_val)
     return inter
 end
 
@@ -618,23 +596,21 @@ function compile_node!(node::VdWInteractionNode, basis::Basis, rng, param_values
         t1, t2 = _vdw_transitions(node)
         inter = VdWInteraction(basis, atom1.inner => atom2.inner, t1, t2, C6_val;
                                V_cap = node.V_cap)
-        inter._coeff[] = node.active ? ComplexF64(C6_val) : ComplexF64(0)
+        inter._amplitude[] = node.active ? 1.0 : 0.0
         node._field = inter
     else
-        node._field.C6    = C6_val
-        node._field.V_cap = node.V_cap
-        node._field._coeff[] = node.active ? ComplexF64(C6_val) : ComplexF64(0)
+        recompile_node!(node, node._field, rng, param_values)
     end
-    node._current_value = ComplexF64(C6_val)
     return node._field
 end
 
+# `_coeff` is recomputed from the separation by `update!`; only C6 and the
+# commanded amplitude are set here.
 function recompile_node!(node::VdWInteractionNode, inter::VdWInteraction, rng, param_values)
-    C6_val = Float64(real(ComplexF64(_resolve_node_value(node.C6, param_values, rng))))
-    inter.C6    = C6_val
+    inter.C6    = Float64(real(ComplexF64(_resolve_node_value(node.C6, param_values, rng))))
     inter.V_cap = node.V_cap
-    inter._coeff[] = node.active ? ComplexF64(C6_val) : ComplexF64(0)
-    node._current_value = ComplexF64(C6_val)
+    inter._amplitude[] = node.active ? 1.0 : 0.0
+    return inter
 end
 
 #=============================================================================
@@ -664,11 +640,132 @@ end
 
 node_output(n::BeamNode) = n._compiled[]
 
+"""
+    LightShiftNode <: AbstractNode
+
+AC Stark shift of one level in a trap beam, added by [`add_light_shift!`](@ref).
+
+Compiles to a [`StarkShiftAC`](@ref) field, which reads `atom.alpha` — the same
+per-level polarizability the dipole force uses, tensor contribution included. The
+node is built late (Phase 3), by which time `initialize!` has filled that array.
+"""
+mutable struct LightShiftNode <: AbstractNode
+    atom::AbstractAtom
+    level::AbstractLevel
+    beam::Any                       # AbstractBeam or BeamNode
+    reference::Union{Nothing, AbstractLevel}
+    active::Bool
+    _field::Any
+end
+
+LightShiftNode(atom, level, beam; reference=nothing, active=true) =
+    LightShiftNode(atom, level, beam, reference, active, nothing)
+
+node_output(n::LightShiftNode) = n._field
+
+# A beam given as a BeamNode must be resolved first.
+node_dependencies(n::LightShiftNode) = n.beam isa BeamNode ? AbstractNode[n.beam] :
+                                                             AbstractNode[]
+
+_lightshift_beam(n::LightShiftNode) = n.beam isa BeamNode ? n.beam._compiled[] : n.beam
+
+function _build_lightshift(node::LightShiftNode, basis::Basis)
+    beam = _lightshift_beam(node)
+    beam === nothing && error("LightShiftNode: beam not resolved yet")
+    idx  = node.atom.level_indices[node.level]
+    ref  = node.reference === nothing ? nothing :
+           node.atom.level_indices[node.reference]
+    λ = getwavelength(beam)
+    haskey(node.atom.inner.alpha, λ) || error(
+        "no polarizability for λ = $(λ*1e9) nm on this atom. add_light_shift! needs " *
+        "the beam to be part of the system (pass it to `System`), so that " *
+        "`initialize!` computes α at its wavelength.")
+    f = StarkShiftAC(basis, node.atom.inner, idx, beam; reference = ref)
+    # `_coeff` too, so `gethamiltonian` shows the peak shift before any `play`.
+    f._amplitude[] = f._coeff[] = node.active ? 1.0 : 0.0
+    node._field = f
+    return f
+end
+
+build_node!(node::LightShiftNode, basis::Basis) =
+    node._field === nothing ? _build_lightshift(node, basis) : node._field
+
+function compile_node!(node::LightShiftNode, basis::Basis, rng, param_values)
+    node._field = nothing          # α and the beam may both have changed
+    return _build_lightshift(node, basis)
+end
+
+# Per shot, `initialize!` refreshes atom.alpha (resampled parameters, a resampled
+# quantization axis). `StarkShiftAC` caches α at construction, so refresh that in
+# place rather than rebuild -- the job holds `f` by reference, and `recompile!`
+# does not use the return value.
+#
+# α is read from `f.atom`, the job's own atom, not `node.atom.inner`: a
+# multi-threaded run gives each thread a deep copy of the job, and only that copy
+# was re-initialised for this shot.
+function recompile_node!(node::LightShiftNode, f::StarkShiftAC, rng, param_values)
+    beam = _lightshift_beam(node)
+    beam === nothing && return f
+    alphas = f.atom.alpha[getwavelength(beam)]
+    α = node.reference === nothing ? alphas[f.level] :
+        alphas[f.level] - alphas[node.atom.level_indices[node.reference]]
+    f._amplitude[] = node.active ? 1.0 : 0.0
+    return Dynamiq.set_alpha!(f, α)
+end
+
+"""
+    QuantizationAxisNode <: AbstractNode
+
+The system's quantization axis — the direction magnetic sublevels are defined
+against. Added with [`add_quantization_axis!`](@ref); defaults to `ẑ` when no node
+is present.
+
+The tensor light shift depends on the angle between the trap polarization and this
+axis, so it must be known before atom polarizabilities are computed. Like
+[`BeamNode`](@ref) it is therefore resolved in compile Phase 1, ahead of
+`initialize!`.
+
+The axis may be a `Parameter` or `ParametricExpression`, which is what makes a
+magic-angle sweep — or a shot-to-shot B-field misalignment — a `play` keyword
+rather than a rebuild.
+"""
+mutable struct QuantizationAxisNode <: AbstractNode
+    axis::Any                                    # 3-vector, possibly parametric
+    _compiled::Ref{Union{Nothing, Vector{Float64}}}
+    QuantizationAxisNode(axis) = new(axis, Ref{Union{Nothing, Vector{Float64}}}(nothing))
+end
+
+node_output(n::QuantizationAxisNode) = n._compiled[]
+
+# Normalise to a unit 3-vector; a zero axis has no direction to define m against.
+function _unit_axis(v)
+    a = Float64.(collect(v))
+    length(a) == 3 || error("quantization axis must be a 3-vector; got length $(length(a))")
+    n = sqrt(sum(abs2, a))
+    n == 0 && error("quantization axis must be nonzero")
+    return a ./ n
+end
+
+build_node!(node::QuantizationAxisNode) =
+    node._compiled[] = _unit_axis(_resolve_node_default(node.axis))
+
+compile_node!(node::QuantizationAxisNode, basis, rng, param_values) =
+    node._compiled[] = _unit_axis(_resolve_node_value(node.axis, param_values, rng))
+
+recompile_node!(node::QuantizationAxisNode, ::Any, rng, param_values) =
+    compile_node!(node, nothing, rng, param_values)
+
 #=============================================================================
 FALLBACK RECOMPILE (non-parametric nodes need no update)
 =============================================================================#
 
 recompile_node!(::AbstractNode, ::Any, ::Any, ::Any) = nothing
+
+# Every switchable field starts a run, and every shot, in its declared state. A
+# sequence may leave it switched on (`On` with no `Off`); without this the next
+# shot -- and the next `play` of the same system -- began with it on.
+_reset_activity!(node::AbstractNode, f) =
+    hasproperty(node, :active) && (Dynamiq.envelope(f)[] = node.active ? 1.0 : 0.0)
 
 #=============================================================================
 NODE DEPENDENCY OVERRIDES  (CouplingNode, NoisyCouplingNode, PlanarCouplingNode)

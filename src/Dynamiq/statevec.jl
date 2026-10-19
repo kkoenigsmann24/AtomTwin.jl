@@ -6,17 +6,37 @@ using LinearAlgebra # Diagonal
 #------------------------------------------------------------------------------
 
 """
+    elementindex(elements)
+
+Map each basis element to its position in `elements`, giving the O(1) reverse
+lookup used when building local operators on a many-body basis.
+"""
+function elementindex(elements::Vector{NTuple{N, Int}}) where {N}
+    index = Dict{NTuple{N, Int}, Int}()
+    sizehint!(index, length(elements))
+    for (k, e) in enumerate(elements)
+        index[e] = k
+    end
+    return index
+end
+
+"""
     Basis{N}
 
 Tensor-product basis for `N` atoms.
 
 Each basis element is an `N`-tuple of internal level indices, one per atom.
 The full Hilbert-space dimension is stored in `dim`.
+
+`index` maps each element back to its position in `elements`, so the partner of
+a basis element under a single-site change is found in O(1) when building local
+operators (see `operator1`). It is the inverse of `elements`.
 """
 struct Basis{N}
     atoms::NTuple{N, AbstractAtom}
     elements::Vector{NTuple{N, Int}}
     dim::Int
+    index::Dict{NTuple{N, Int}, Int}
 
     """
         Basis(atoms::Vector; maxoccupations = [])
@@ -44,7 +64,8 @@ struct Basis{N}
             atom._pidx = [findall(v -> v[i] == lvl, elements) for lvl in 1:atom.n]
         end
 
-        new{length(atoms)}(Tuple(atoms), elements, length(elements))
+        new{length(atoms)}(Tuple(atoms), elements, length(elements),
+                           elementindex(elements))
     end
 
     """
@@ -56,7 +77,8 @@ struct Basis{N}
     subspace or symmetry sector is required.
     """
     function Basis(atoms::Vector, elements::Vector)
-        new{length(atoms)}(Tuple(atoms), elements, length(elements))
+        new{length(atoms)}(Tuple(atoms), elements, length(elements),
+                           elementindex(elements))
     end
 end
 
@@ -199,6 +221,20 @@ function Op(b::Basis,
     forward = [(i, j, rate * v) for (i, j, v) in forward]
     reverse = [(i, j, rate * u) for (i, j, u) in reverse]
     return Op(forward, reverse, b.dim)
+end
+
+"""
+    rescale!(op::Op, s) -> op
+
+Multiply every entry of `op` by `s`, in place. How a field's operator follows a
+new rate without being rebuilt.
+"""
+function rescale!(op::Op, s::Number)
+    for v in (op.forward, op.reverse), k in eachindex(v)
+        i, j, x = v[k]
+        v[k] = (i, j, x * s)
+    end
+    return op
 end
 
 """
@@ -364,13 +400,18 @@ function operator1(b::Basis, atoms::Vector{<:AbstractAtom},
         atomidx = findfirst(a -> a == atom, b.atoms)
         i = Int[]
         j = Int[]
-        for (x, b1) in enumerate(b.elements), (y, b2) in enumerate(b.elements)
-            if b1[atomidx] == lvl2 && b2[atomidx] == lvl1 &&
-               issame(b1, b2, except = [atomidx])
-                if blockade == 0 || (sum(b1 .== blockade) < 2 && sum(b2 .== blockade) < 2)
-                    push!(i, x)
-                    push!(j, y)
-                end
+        # The partner of `b1` is not searched for but computed: it is `b1` with
+        # site `atomidx` set to `lvl1`, which satisfies `issame(b1, b2,
+        # except = [atomidx])` by construction. One pass plus an O(1) lookup
+        # therefore replaces a scan over every pair of basis elements.
+        for (x, b1) in enumerate(b.elements)
+            b1[atomidx] == lvl2 || continue
+            b2 = Base.setindex(b1, lvl1, atomidx)
+            y = get(b.index, b2, 0)
+            y == 0 && continue   # partner outside a truncated basis
+            if blockade == 0 || (sum(b1 .== blockade) < 2 && sum(b2 .== blockade) < 2)
+                push!(i, x)
+                push!(j, y)
             end
         end
         v = rate * ones(ComplexF64, length(i))
@@ -392,7 +433,17 @@ end
 """
     operator2(b, atoms, transition1, transition2; jump = false)
 
-Two-atom operator constructed from a pair of single-atom transitions.
+Two-atom operator `Â₁ ⊗ Â₂` constructed from a pair of single-atom transitions,
+where `Âₖ` is the raising/lowering operator of `transitionₖ` on atom `k`.
+
+The two single-atom operators act on disjoint sites, so the two-body operator is
+their product. Because each atom's forward operator has at most one entry per
+column, the product's forward triplets are obtained by chaining `f1`'s columns
+into `f2`'s rows. For a Hamiltonian term (`jump = false`) the `reverse` part
+carries the Hermitian conjugate of the off-diagonal forward entries; a diagonal
+term (e.g. the blockade projector `(r,r) => (r,r)`) therefore has empty
+`reverse`, while an off-diagonal exchange term (`(0,1) => (1,0)`, i.e. σ₁⁺σ₂⁻)
+gets its `+ h.c.` automatically.
 
 Returns `(forward, reverse)` triplet lists for use in `Op(forward, reverse, b.dim)`.
 """
@@ -402,12 +453,24 @@ function operator2(b::Basis,
                    transition2::Pair{Int,Int};
                    jump::Bool = false)
     atom1, atom2 = atoms
-    f1, r1 = operator1(b, [atom1], transition1, 1.0, jump = jump)
-    f2, r2 = operator1(b, [atom2], transition2, 1.0, jump = jump)
+    # Forward parts are the bare ladder operators of each transition; compose
+    # them (`jump = true` keeps everything in `forward`, so this works for both).
+    f1, _ = operator1(b, [atom1], transition1, 1.0, jump = true)
+    f2, _ = operator1(b, [atom2], transition2, 1.0, jump = true)
 
-    # Pairwise intersection on triplets for forward and reverse parts
-    forward = intersect(f1, f2)
-    reverse = intersect(r1, r2)
+    # Product Â₁·Â₂: match atom1's target column to atom2's source row.
+    forward = Tuple{Int,Int,ComplexF64}[]
+    for (i, j, v) in f1, (jj, k, w) in f2
+        j == jj && push!(forward, (i, k, v * w))
+    end
+
+    # Hamiltonian terms carry the Hermitian conjugate; jump operators are one-way.
+    reverse = Tuple{Int,Int,ComplexF64}[]
+    if !jump
+        for (i, j, v) in forward
+            i != j && push!(reverse, (j, i, conj(v)))
+        end
+    end
 
     return forward, reverse
 end

@@ -38,9 +38,14 @@ which creates an empty sequence with the given default time step.
 """
 struct Sequence
     instructions::Vector{AbstractInstruction}
-    dt::Float64
+    dt::Union{Float64,Nothing}     # `nothing` ⇒ derive from ‖H‖ and `tol` at build time
     downsample::Int
+    tol::Float64                   # target local error per step (NOT a global bound)
 end
+
+# The 0.1 three-field positional form.
+Sequence(instructions::Vector{<:AbstractInstruction}, dt, downsample::Int) =
+    Sequence(instructions, dt, downsample, 1e-6)
 
 """
     Sequence(dt::Float64; downsample::Int = 1)
@@ -83,10 +88,75 @@ push!(seq, Wait(1e-6))                # coarse dt (default) for slow evolution
 push!(seq, Ramp(tw, r, a, t; downsample=10))  # sparse output for slow ramp
 ```
 """
-function Sequence(dt::Float64; downsample::Int = 1)
+function Sequence(dt::Float64; downsample::Int = 1, tol::Float64 = 1e-6)
     dt > 0 || throw(ArgumentError("dt must be positive, got $dt"))
     downsample > 0 || throw(ArgumentError("downsample must be positive, got $downsample"))
-    return Sequence(AbstractInstruction[], dt, downsample)
+    tol > 0 || throw(ArgumentError("tol must be positive, got $tol"))
+    return Sequence(AbstractInstruction[], dt, downsample, tol)
+end
+
+"""
+    Sequence(; downsample = 1, tol = 1e-6)
+
+Create a `Sequence` with **no explicit time step**: the output grid is derived
+at build time, and the solvers meet `tol` within it.
+
+The derived step is the output resolution, not the integration step -- by
+default one sample at the end of each instruction, or finer if the Hamiltonian
+needs it (`Dynamiq.suggested_dt`). Within a step:
+
+- the **density-matrix** solver sub-divides adaptively until each sub-step's
+  error is below `tol`, reading shaped envelopes and moving beams at every
+  sub-step, so `tol` controls the result;
+- the **statevector** solvers are exact for a Hamiltonian that is constant over
+  the step, but read a time-dependent one (a shaped pulse, a ramp, a move) once
+  per step. There `tol` does not control the error: pass `dt` fine enough to
+  resolve the drive. `compile` warns when this applies.
+
+The MCWF solver needs no tolerance of its own: it places every quantum jump at the
+time its norm threshold is crossed.
+
+```julia
+seq = Sequence()                  # one output sample per instruction, tol = 1e-6
+seq = Sequence(; tol = 1e-9)      # tighter
+seq = Sequence(1e-9)              # explicit dt: a trace, and the control grid
+```
+"""
+function Sequence(; downsample::Int = 1, tol::Float64 = 1e-6)
+    downsample > 0 || throw(ArgumentError("downsample must be positive, got $downsample"))
+    tol > 0 || throw(ArgumentError("tol must be positive, got $tol"))
+    return Sequence(AbstractInstruction[], nothing, downsample, tol)
+end
+
+"""
+    Sequence(instruction_duration, tsteps::Integer; downsample = 1)
+
+Create a `Sequence` whose step is `instruction_duration / tsteps`, i.e. specify
+how many steps an instruction of that length should take rather than how long
+each step is.
+
+This is often the clearer way to say it. The duration of an instruction is
+physical; the step is a discretisation choice that only has to divide it. Giving
+a step count makes that relationship explicit and cannot produce a step which
+fails to divide the duration:
+
+```julia
+seq = Sequence(2e-6, 2000)     # a 2 µs pulse in 2000 steps  (dt = 1 ns)
+seq = Sequence(1e-9)           # equivalent, stated as a step
+```
+
+Note `dt` still applies to *every* instruction, so an instruction of a different
+length simply takes proportionally more or fewer steps — `tsteps` is not a
+per-instruction step count. Use the `dt` keyword on an individual instruction to
+override it, or `Sequence(; tol = ...)` to let the solver choose.
+"""
+function Sequence(instruction_duration::Real, tsteps::Integer; downsample::Int = 1,
+                  tol::Float64 = 1e-6)
+    instruction_duration > 0 ||
+        throw(ArgumentError("instruction_duration must be positive, got $instruction_duration"))
+    tsteps > 0 || throw(ArgumentError("tsteps must be positive, got $tsteps"))
+    return Sequence(Float64(instruction_duration) / tsteps; downsample = downsample,
+                    tol = tol)
 end
 
 """

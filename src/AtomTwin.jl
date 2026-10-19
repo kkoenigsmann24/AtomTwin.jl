@@ -35,13 +35,19 @@ include("Dynamiq/Dynamiq.jl")
 import .Dynamiq: GaussianBeam, GeneralGaussianBeam
 using .Dynamiq: PlanarBeam
 using .Dynamiq: GlobalCoupling, PlanarCoupling, Detuning, Interaction, VdWInteraction, GaussianCoupling
-using .Dynamiq: Jump, AbstractAtom, NLevelAtom, Basis, Op
+using .Dynamiq: Hamiltonian
+using .Dynamiq: StarkShiftAC
+using .Dynamiq: Jump, AbstractAtom, NLevelAtom, Basis
+import .Dynamiq: Op   # extended with an (Operator, sys, atom) materialisation method in operators.jl
 using .Dynamiq: productstate, build_detector, evolve!
 using .Dynamiq: getposition, getwavelength, getbeams
 using .Dynamiq: AbstractModifier, AbstractBeam
 using .Dynamiq: DetectorSpec, AbstractDetector
 using .Dynamiq: PopulationDetector, CoherenceDetector
-using .Dynamiq: MoveModifier, AmplitudeModifier, AbstractBoundaryModifier, SetModifier, ResetModifier, PositionModifier, begin_instruction!, end_instruction!
+using .Dynamiq: ExpectationDetector
+import .Dynamiq: ExpectationDetectorSpec   # extended with an (sys, atom, Operator) method in operators.jl
+using .Dynamiq: PhotoDetector, PhotoDetectorSpec
+using .Dynamiq: MoveModifier, AmplitudeModifier, AbstractBoundaryModifier, SetModifier, ResetModifier, PositionModifier, begin_instruction!, end_instruction!, restore_beam!
 using .Dynamiq: Units; export Units
 
 import Base: copy
@@ -61,6 +67,9 @@ include("system.jl")
 include("atoms/polarizability.jl")
 include("atoms/atoms.jl")
 include("atoms/ytterbium171atom.jl")
+include("atoms/ytterbium174atom.jl")   # reuses the Yb-171 1S0/3P0 models
+include("atoms/rubidium87atom.jl")
+include("atoms/strontium88atom.jl")
 include("detectors.jl")
 include("job.jl")
 include("play.jl")
@@ -69,6 +78,7 @@ include("physics/couplings.jl")
 include("physics/detunings.jl")
 include("physics/dissipators.jl")
 include("physics/interactions.jl")
+include("operators.jl")
 include("resolve.jl")
 include("Visualization.jl")
 include("tomography.jl")
@@ -76,6 +86,7 @@ include("tomography.jl")
 # Export beams and fields
 export GaussianBeam, GeneralGaussianBeam, PlanarBeam
 export GlobalCoupling, PlanarCoupling, Detuning, Interaction, VdWInteraction, GaussianCoupling
+export StarkShiftAC
 
 # Export quantum types
 export Jump, AbstractAtom, NLevelAtom, Basis
@@ -94,6 +105,8 @@ export DetectorSpec, AbstractDetector
 export PopulationDetector, CoherenceDetector
 export PopulationDetectorSpec, CoherenceDetectorSpec
 export MotionDetectorSpec, FieldDetectorSpec
+export ExpectationDetector, ExpectationDetectorSpec
+export PhotoDetector, PhotoDetectorSpec
 export add_detector!
 
 # Export abstract types
@@ -113,7 +126,13 @@ export LaserPhaseNoiseModel
 # Export levels
 export HyperfineManifold, FineManifold
 export Level, FineLevel, HyperfineLevel
+export TermSymbol, @term, @l_str
 export Superposition
+# `Operator` is exported; the `transition`/`projector` constructors are NOT, because
+# they collide with QuantumOptics' exports (AtomTwin is routinely `using`-ed alongside
+# QuantumOptics for crosschecks). Use `AtomTwin.transition`/`AtomTwin.projector`, or the
+# collision-free ket–bra syntax `ket * bra'` (e.g. `l1 * l0'`), which needs no export.
+export Operator
 
 # Export tweezers
 export TweezerArray
@@ -121,10 +140,12 @@ export TweezerArray
 # Export system and compilation
 export System
 export getqstate, compile, getmatrix, gethamiltonian, getbasis
+export getjumps, getheffective, getliouvillian
 
 # Export polarizability
 export PolarizabilityModel, PolarizabilityCurve
 export light_shift_coeff_Hz_per_Wcm2
+export scattering_rate_per_Wcm2
 export polarizability_au, polarizability_si
 
 # Export simulation
@@ -134,9 +155,12 @@ export play
 
 # Export physics utilities
 export add_zeeman_detunings!
+export add_quantization_axis!, getquantizationaxis
+export add_light_shift!
 export add_coupling!, add_detuning!, rabi_frequencies
 export add_decay!, add_dephasing!
 export add_interaction!, add_vdwinteraction!
+export add_hamiltonian!
 
 # Export sequence instructions
 export Sequence, @sequence
@@ -149,7 +173,9 @@ export Parallel
 
 # Export atoms
 export Atom
-export Ytterbium171Atom
+export Ytterbium171Atom, Ytterbium174Atom
+# Species term-symbol namespaces (Ytterbium171._3P1, or l"3P1")
+export Ytterbium171, Ytterbium174, Strontium88
 export Potassium39Atom, Rubidium87Atom, Strontium88Atom
 export getspecies
 
@@ -167,5 +193,61 @@ export resolve
 
 # Export analysis
 export process_tomography
+
+#------------------------------------------------------------------------------
+# Load-time initialisation
+#------------------------------------------------------------------------------
+
+# Size the per-thread workspace caches for this session. `ThreadCache` sizes its
+# slot vector at construction, which for a `const` global is package build time.
+# A stale size is safe -- `get_ws!` grows it under lock on first touch -- but
+# doing it here keeps that off the first parallel run's critical path.
+__init__() = Dynamiq.reset_workspaces!()
+
+#------------------------------------------------------------------------------
+# Precompilation
+#------------------------------------------------------------------------------
+
+using PrecompileTools: @setup_workload, @compile_workload
+
+# Compile the solver entry points so they are not built afresh in every session.
+#
+# The workload runs at package build time, so anything it leaves in module-level
+# mutable state is serialised into the package image. Dynamiq's `ThreadCache`
+# globals are populated as a side effect of stepping and are cleared afterwards.
+@setup_workload begin
+    # Not `g, e`: `g` is `Units.g` (grams), and assigning to an imported binding
+    # is a precompile error on julia 1.11.
+    lvl_g, lvl_e = Level("g"), Level("e")
+    @compile_workload begin
+        # Statevector, trajectories and density matrix: three solver entry
+        # points and their detector machinery.
+        atoms  = [Atom(; levels = [lvl_g, lvl_e]) for _ in 1:2]
+        system = System(atoms)
+        cs = [add_coupling!(system, a, lvl_g => lvl_e, 2π * 1e6; active = false) for a in atoms]
+        add_interaction!(system, (atoms[1], atoms[2]), (lvl_e, lvl_e) => (lvl_e, lvl_e), 2π * 1e6)
+        add_decay!(system, atoms[1], lvl_e => lvl_g, 2π * 1e5)
+        add_dephasing!(system, atoms[2], lvl_e, 2π * 1e5)
+        add_detector!(system, PopulationDetectorSpec(atoms[1], lvl_e; name = "P"))
+        add_detector!(system, CoherenceDetectorSpec(atoms[1]; levels = 1 => 2, name = "C"))
+
+        seq = Sequence(1e-8; tol = 1e-4)
+        @sequence seq begin
+            Pulse(cs, 1e-7)
+            Wait(1e-8)
+        end
+
+        # Silenced: the single-shot run on a dissipative system trips the
+        # "shots = 1" advice, which would otherwise print on every install.
+        Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+            play(system, seq; initial_state = [lvl_g, lvl_g])
+            play(system, seq; initial_state = [lvl_g, lvl_g], shots = 2)
+            play(system, seq; initial_state = [lvl_g, lvl_g], density_matrix = true)
+        end
+    end
+
+    # Drop what the workload left in the thread caches.
+    Dynamiq.reset_workspaces!()
+end
 
 end # module AtomTwin

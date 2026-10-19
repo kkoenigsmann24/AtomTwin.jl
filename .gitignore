@@ -1,0 +1,9 @@
+Manifest.toml
+docs/Manifest.toml
+docs/build/
+examples/optical_molasses.jl
+CLAUDE.md
+CONTRIBUTING.html
+memory/
+.claude/
+.DS_Store

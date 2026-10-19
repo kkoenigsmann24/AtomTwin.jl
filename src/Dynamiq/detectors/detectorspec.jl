@@ -50,7 +50,7 @@ function build_detector(spec::DetectorSpec,
                          ) where T
 
     # Apply resolve_target to the object reference
-    # (mostly for Deferred parameters; deepcopy already handles atom refs)
+    # (mostly for parametric values; deepcopy already handles atom refs)
     obj = resolve_target(spec.obj)
     p   = spec.params
 
@@ -90,6 +90,22 @@ function build_detector(spec::DetectorSpec,
             p.levels,
             tspan,  # view into global tspan
             vals;   # view into detector-specific vals array
+            name = p.name
+        )
+    elseif spec.kind === ExpectationDetector
+        # `obj` is the operator itself (basis-global; not an atom to resolve).
+        return ExpectationDetector(
+            system.state[],
+            obj,
+            tspan,  # view into global tspan
+            vals;   # view into detector-specific vals array
+            name = p.name
+        )
+    elseif spec.kind === PhotoDetector
+        # No state/atom target: counts are written by the jump it is bound to.
+        return PhotoDetector(
+            tspan,  # view into global tspan
+            vals;   # view into detector-specific vals array (Int)
             name = p.name
         )
     end

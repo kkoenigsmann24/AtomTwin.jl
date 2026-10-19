@@ -59,10 +59,49 @@ This installs dependencies for AtomTwin, Dynamiq, and the documentation/examples
 To run the tests:
 
 ```bash
-ATOMTWIN_RUN_EXAMPLES=true julia --project=. -e 'using Pkg; Pkg.test("AtomTwin")'
+julia --project=. -e 'using Pkg; Pkg.test("AtomTwin")'
 ```
 
-This should exercise AtomTwin’s tests, including checks tied to `test/examples_src`.
+To also run the examples, which print a runtime and checksum per script:
+
+```bash
+ATOMTWIN_RUN_EXAMPLES=true julia -t10 --project=. -e 'using Pkg; Pkg.test("AtomTwin")'
+```
+
+This exercises the checks tied to `test/examples_src`.
+
+If you are reading those runtimes, add `--check-bounds=auto`:
+
+```bash
+ATOMTWIN_RUN_EXAMPLES=true julia -t10 --project=. \
+  -e 'using Pkg; Pkg.test("AtomTwin"; julia_args=["--check-bounds=auto"])'
+```
+
+`Pkg.test` otherwise forces `--check-bounds=yes`, which overrides every
+`@inbounds` in the package — including the solver hot loops — and inflates the
+reported runtimes about 2.5x. Checksums are unaffected, and the test suite says
+so when it applies, so there is no need to remember this.
+
+To build the documentation, exactly as CI does:
+
+```bash
+julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
+DOCUMENTER_RUN_EXAMPLES=false julia --project=docs docs/make.jl
+```
+
+**Run this before pushing.** The test suite does not cover it, and several
+failure modes reach CI only here:
+
+- A `@ref` to something no `@docs` block lists — an unexported name, a private
+  helper, or an exported one nobody added to the API page. `makedocs` treats an
+  unresolved cross-reference as fatal.
+- A new example registered in `docs/make.jl` that Literate cannot process.
+- `docs/src/*.md` drifting from the sources it is generated from. The build
+  rewrites those files, so a clean `git status` afterwards is part of the check;
+  commit them if they changed.
+
+CI runs the docs job on Julia 1.11, so prefer that version if a failure will not
+reproduce for you locally.
 
 ***
 
@@ -78,9 +117,25 @@ Typical changes:
 
 Guidelines:
 
-- Every major new user-visible feature or feature set should be covered by:
-  - An example script in `examples/`, and  
-  - A corresponding ground-truth test under `test/examples_src` for testing and documentation consistency.  
+- Every major new user-visible feature or feature set should be covered by an
+  example.
+
+An example has one source and two generated forms, so add it in this order:
+
+1. **Write it in `test/examples_src/`.** This is the source of truth. Lines
+   tagged `#src` run under test but are stripped from everything published, so
+   they hold the coarse-resolution settings and the `descriptor` / `runtime` /
+   `checksum_data` block the suite reads. Tag *both* halves of anything that
+   spans lines: a stripped continuation line leaves the published file
+   unparseable, and the test suite will not notice, because under test the
+   tagged lines are the ones that run.
+2. **Register it in `test/runtests.jl`**, in the `examples` list, so it runs as a
+   regression test.
+3. **Register it in `docs/make.jl`**, in `example_titles`, so Literate generates
+   its page and its `examples/` script.
+
+`examples/` and `docs/src/*.md` are both generated from step 1 — do not edit
+them by hand. Build the docs (above) to regenerate, and commit the result.
 
 ***
 
@@ -182,12 +237,9 @@ julia --project=docs docs/make.jl
 
 This compiles the documentation and writes the generated HTML into the docs build directory `docs/build`.
 
-To publish the updated documentation:
-
-1. Ensure `docs/make.jl` has completed successfully.
-2. Check out the `pages` branch of AtomTwin.
-3. Inspect and copy the generated build files (e.g. from `docs/build/`) into the root of the `pages` branch.
-4. Commit and push the changes on `pages` so that the hosted documentation is updated.
+Publishing is automatic: CI's documentation job runs `docs/make.jl`, whose
+`deploydocs` pushes the build to the `gh-pages` branch for pushes to `main` and for
+release tags.
 
 ***
 
